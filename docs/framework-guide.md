@@ -74,10 +74,13 @@ class SessionConfig:
 ```python
 @pytest.fixture(scope="function")
 def browser_driver():
+    logging.info("Launching browser...")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False, args=["--start-maximized"], ignore_default_args=["--enable-automation"])
         context = browser.new_context()
         page = context.new_page()
+        logging.info("Browser launched successfully.")
+        logging.info("Goto test website.")
         page.goto(SessionConfig.ENV_CONFIG["test_url"])
         yield page
         context.close()
@@ -91,7 +94,7 @@ def browser_driver():
 - 進入指定 URL
 - 測試結束後關閉 browser
 
-也就是說，每個測試都會獨立拿到一個 browser/page 實例，避免相互污染。
+也就是說，每個測試都會獨立拿到一個 browser/page 實例，避免相互污染；過程中的關鍵步驟（啟動、進入網站）都會透過 `logging` 輸出，方便追蹤執行狀況。
 
 ## 4. Test / Script / Page 的實際資料流
 
@@ -103,7 +106,7 @@ import pytest
 from scripts.searchScript import search
 
 @pytest.mark.demo
-def test_google_search(browser_driver):
+def test_online_store_search(browser_driver):
     search(browser_driver)
 ```
 
@@ -144,12 +147,30 @@ def search(page):
 
 ### 5.1 安裝依賴
 
+先把根目錄的 `env_example` 資料夾改名為 `env`（`env/` 已被 `.gitignore` 忽略，不會進版控，需要各自建立）：
+
 ```bash
 python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
 python -m playwright install
 ```
+
+#### （選用）安裝 Allure commandline
+
+`requirements.txt` 已包含 `allure-pytest`，這只負責在測試過程中收集 raw results；要把 raw results 轉成 HTML 報告，還需要另外安裝 Allure commandline（非 pip 套件），並確保它在 `PATH` 中，同時需要 Java 8 以上的執行環境：
+
+```bash
+scoop install allure
+```
+
+或：
+
+```bash
+npm install -g allure-commandline
+```
+
+沒有安裝的話，`run.py` 仍會正常執行 pytest，只是會在終端機印出警告並略過報告產生（詳見 5.4）。
 
 ### 5.2 執行單一測試
 
@@ -165,19 +186,56 @@ python -m playwright install
 
 ### 5.4 使用 `run.py`
 
-根目錄的 `run.py` 目前僅簡單包裝 pytest：
+根目錄的 `run.py` 目前的職責是「執行 pytest，並在結束後自動把結果轉成 Allure HTML 報告」：
 
 ```python
-import pytest
+def main() -> int:
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    report_dir = ROOT_DIR / "report" / timestamp
+    raw_results_dir = tempfile.mkdtemp(prefix="allure-results-")
 
-pytest.main()
+    try:
+        exit_code = pytest.main(sys.argv[1:] + ["--alluredir", raw_results_dir])
+        generate_allure_report(raw_results_dir, report_dir)
+    finally:
+        shutil.rmtree(raw_results_dir, ignore_errors=True)
+
+    return exit_code
 ```
+
+`generate_allure_report()` 會用 `shutil.which` 找 `allure` / `allure.bat` / `allure.cmd` 執行檔：
+
+```python
+def generate_allure_report(raw_results_dir: str, report_dir: Path) -> None:
+    allure_cmd = shutil.which("allure") or shutil.which("allure.bat") or shutil.which("allure.cmd")
+    if not allure_cmd:
+        print("[run.py] 找不到 Allure commandline，略過報告產生。", file=sys.stderr)
+        return
+
+    try:
+        subprocess.run(
+            [allure_cmd, "generate", raw_results_dir, "-o", str(report_dir), "--clean"],
+            shell=(os.name == "nt"),
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"[run.py] Allure 報告產生失敗: {e}", file=sys.stderr)
+```
+
+實際流程：
+1. 用時間戳記建立輸出目錄 `report/<yyyyMMddHHmmss>/`
+2. 用暫存資料夾接收 pytest 這次執行產生的 allure raw results（透過 `--alluredir`）
+3. 呼叫 `allure generate` 把 raw results 轉成 HTML，輸出到 `report/<timestamp>/`
+4. 執行完畢（不論成功或失敗）都會清掉暫存的 raw results 資料夾
+5. 找不到 Allure commandline 時只印警告，不會讓整個流程失敗
 
 執行方式：
 
 ```bash
 .\.venv\Scripts\python.exe run.py
 ```
+
+執行完成後開啟 `report/<timestamp>/index.html` 即可看報告。
 
 ## 6. 命名與維護建議
 
@@ -199,6 +257,7 @@ pytest.main()
 - Page Object 的分層邏輯清楚
 - Playwright 的真實瀏覽器操作
 - 可透過 `--env` 讀取不同環境設定
+- 透過 `run.py` 執行後可自動產生 Allure HTML 報告
 
 這使它很適合作為：
 - 小型測試專案
@@ -218,8 +277,8 @@ pytest.main()
 3. `page` 層 selector 直接寫在類別中
    - 若網站變更，維護成本會上升。
 
-4. 缺少報告與截圖機制
-   - 目前沒有 Allure 或 HTML report 整合。
+4. 缺少失敗自動截圖機制
+   - `run.py` 已能產生 Allure HTML 報告，但目前沒有在測試失敗時自動截圖並附加到報告中。
 
 5. 缺少共用基底類別與 utility
    - 例如 `base_page.py`、`selectors.py`、`config.py` 等等。
@@ -231,7 +290,7 @@ pytest.main()
 - `base_page.py`：封裝 `click`、`fill`、`wait` 等共用方法
 - `selectors.py`：集中管理所有 selector
 - `config.py`：管理 timeout、base url、browser 設定
-- `report/`：輸出測試報告與失敗截圖
+- 失敗自動截圖：可在 pytest hook（例如 `pytest_runtest_makereport`）中擷取截圖，並透過 `allure.attach` 附加到現有的 Allure 報告
 - `data/`：測試資料管理
 
 這樣可以在不重構整個專案的情況下，逐步提升可維護性。
@@ -244,5 +303,6 @@ pytest.main()
 - Environment 管理
 - Playwright 瀏覽器起動
 - 可重用的搜尋流程範例
+- Allure HTML 報告產生（`run.py`）
 
-未來若要成為真正可維護的自動化測試框架，重點在於補強環境抽象、selector 管理、報告整合與可重用的基礎元件，而不是重寫整套架構。
+未來若要成為真正可維護的自動化測試框架，重點在於補強環境抽象、selector 管理、失敗截圖與可重用的基礎元件，而不是重寫整套架構。
